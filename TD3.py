@@ -12,6 +12,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import datetime
+import os
+import glob
 
 
 #Step 2: Define Actor and Critic Networks
@@ -78,9 +80,8 @@ class ReplayMemory:
     
 # Assuming you have defined your DRL agent class with methods like 'select_action', 'optimize_model', etc.
 class TD3Agent:
-    def __init__(self, numtickers, data, learning_rate=1e-4, tau=0.005,gamma=0.99, memory_size=10000, batch_size=128, policy_noise=0.2, noise_clip=0.5, policy_freq=4, target_update_interval=10):
+    def __init__(self, numtickers,tickers, data, learning_rate=1e-4, tau=0.005,gamma=0.99, memory_size=10000, batch_size=128, policy_noise=0.2, noise_clip=0.5, policy_freq=4, target_update_interval=10):
         self.numtickers = numtickers
-        #self.k_max = k_max
         self.gamma = gamma
         self.batch_size = batch_size
         self.policy_noise = policy_noise
@@ -99,6 +100,7 @@ class TD3Agent:
         self.max_action=1
         self.total_it = 0
         self.tau=tau
+        self.tickers=tickers
         
         # Assuming data contains state information and is pre-processed
         # Will add portfolio rate for each tickers into the state later. 
@@ -126,6 +128,13 @@ class TD3Agent:
         self.train_std = torch.std(self.train_data, dim=0)
         self.train_norm = (self.train_data - self.train_mean) / self.train_std
         self.validation_norm = (self.validation_data - self.train_mean) / self.train_std
+ 
+        folder_name = f'./{self.current_time}_model_chekpoint'  # Replace with your desired folder name
+        path = os.path.join(os.getcwd(), folder_name)  # Creates a path in the current working directory
+        self.folder_name=path
+
+
+        
 
     def select_action(self, normalized_action,current_holding):
         # Extract necessary components from the state
@@ -142,7 +151,7 @@ class TD3Agent:
         for j,i in enumerate(normalized_action):
             i=round(i,2)
             if i>0:
-                action.append(int((i *0.05* currentbalance)/closing_prices[j]))
+                action.append(int((i * currentbalance)/(self.numtickers*closing_prices[j])))
             elif i<=0:
                 action.append(int(i * currentholding[j]))
             else:
@@ -176,7 +185,7 @@ class TD3Agent:
         reward_batch = torch.tensor(batch.reward, dtype=torch.float32).to(device)
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)), dtype=torch.bool).to(device)
         non_final_next_states = torch.cat([s.unsqueeze(0) for s in batch.next_state if s is not None], dim=0).to(device)
-
+        non_final_next_states=non_final_next_states.to(torch.float32)
         # Update Critic
         with torch.no_grad():
             # Adding noise to the action for the next state for target policy smoothing
@@ -269,42 +278,48 @@ class TD3Agent:
         next_state_features[0:1+self.numtickers]=new_total_port_ratio
         next_state_holding[1:1+self.numtickers+1]=torch.tensor([newbalance.tolist()]+newholding.tolist())
         #next_state_holding[0]=next_state_holding[0]
-        return next_state_features,next_state_holding,reward
+        return next_state_features,next_state_holding,reward,current_total_port
     
     def save_model(self, file_name):
         torch.save(self.actor.state_dict(), file_name + "_actor.pth")
         torch.save(self.critic.state_dict(), file_name + "_critic.pth")
     
-        
-    def generate_experience(self):
-        #replay_memory = deque(maxlen=10000)
-
-        def generate_episode(data_tensor, start_index, episode_length):
+    @staticmethod
+    def generate_episode(data_tensor, start_index, episode_length):
             end_index = min(start_index + episode_length, data_tensor.size(0))
             return data_tensor[start_index:end_index]
         
-        episode_length = 150  # Length of each episode
-        stride = 30  # Determines overlap between episodes
-        
-        def check_if_done(timestep, max_timesteps, portfolio_value, stop_loss=float('-inf'), take_profit=float('inf')):
-            # Check if end of data is reached
-            if timestep >= max_timesteps - 2:
-                return True
-            # Check for stop-loss or take-profit conditions
-            if portfolio_value <= stop_loss or portfolio_value >= take_profit:
-                return True
+    @staticmethod
+    def check_if_done(timestep, max_timesteps, portfolio_value, stop_loss=float('-inf'), take_profit=float('inf')):
+        # Check if end of data is reached
+        if timestep >= max_timesteps - 2:
+            return True
+        # Check for stop-loss or take-profit conditions
+        if portfolio_value <= stop_loss or portfolio_value >= take_profit:
+            return True
 
-            # Other conditions can be added here
-            return False
+        # Other conditions can be added here
+        return False            
 
+    def generate_episodes(self,data_norm,holding,episode_length = 150,stride=30):
         episodes = []
         tensor_to_add = torch.tensor([1]+[0]*self.numtickers)
-        
-        for i in range(0, self.train_norm.size(0) - episode_length + 1, stride):         
-            feature= generate_episode(self.train_norm, i, episode_length)
+          # Length of each episode
+        stride = 30  # Determines overlap between episodes
+        for i in range(0, data_norm.size(0) - episode_length + 1, stride):         
+            feature= self.generate_episode(data_norm, i, episode_length)
             tensor_to_add_repeated = tensor_to_add.repeat(feature.shape[0], 1)
-            episodes.append((torch.cat((tensor_to_add_repeated,feature),dim=1),generate_episode(self.train_holding, i, episode_length)))
-            #episodes['holding'].append(generate_episode(self.train_holding, i, episode_length))
+            episodes.append((torch.cat((tensor_to_add_repeated,feature),dim=1),self.generate_episode(holding, i, episode_length)))
+        return episodes
+       
+    def generate_experience(self,label):
+        #replay_memory = deque(maxlen=10000)
+
+        if not os.path.exists(f'{self.folder_name}_{label}'):
+            os.makedirs(f'{self.folder_name}_{label}')
+
+        episodes = self.generate_episodes(self.train_norm,self.train_holding)
+        #episodes['holding'].append(generate_episode(self.train_holding, i, episode_length))
         # Assuming 'state_tensor' is a tensor containing all the states for the episodes
         
         
@@ -321,11 +336,12 @@ class TD3Agent:
                 #done = is_end_of_episode(next_index)
 
                 # Update state and calculate reward based on your function
+                current_features=current_features.to(torch.float32)
                 normalized_action=self.actor(current_features).tolist()
                 action=agent.select_action(normalized_action,current_holding)
-                next_state_features,next_state_holding,reward = agent.update_state_and_calculate_reward(action, current_features,next_state_features,current_holding, next_state_holding)
+                next_state_features,next_state_holding,reward,new_total_port = agent.update_state_and_calculate_reward(action, current_features,next_state_features,current_holding, next_state_holding)
                 #next_state_holding,reward 
-                done = check_if_done(index_val, len(holding),reward)
+                done = self.check_if_done(index_val, len(holding),reward)
                 # Remember the experience
                 agent.remember(current_features, torch.tensor(normalized_action), next_state_features, reward,done)
                 
@@ -334,22 +350,36 @@ class TD3Agent:
                 self.optimize_model()
                 if done:
                     break
-            if j % 20 == 0:
-                self.save_model(f'/{self.current_time}_model_chekpoint/{j}')
+            if j % 5 == 0:
+                self.save_model(f'/{self.folder_name}_{label}/{j}')
                 # Move to the next state
             #if j % self.TARGET_UPDATE == 0:
             #    self.update_target_network()
-    def validation(self,path):
-        self.actor.load_state_dict(torch.load(f'./{path}/model_chekpoint_2023-11-17_15-14-41_80_actor.pth'))
-        self.actor.eval()
+    
+        
+    def validate_single_mdoel(self,actionstrategy=True):
+        '''
         tensor_to_add = torch.tensor([1]+[0]*self.numtickers)
-        tensor_to_add_repeated = tensor_to_add.repeat(self.validation_data.shape[0], 1)
-        validation_data=torch.cat((tensor_to_add_repeated,self.validation_data),dim=1)
+        # Length of each episode
+        #stride = 30  # Determines overlap between episodes
+        #for i in range(0, data_norm.size(0) - episode_length + 1, stride):         
+        feature= self.validation_norm
+        #self.generate_episode(data_norm, i, episode_length)
+        tensor_to_add_repeated = tensor_to_add.repeat(feature.shape[0], 1)
+        validation=torch.cat((tensor_to_add_repeated,feature),dim=1)
+        #,self.generate_episode(holding, i, episode_length)))
+        '''
+        tensor_to_add = torch.tensor([1]+[0]*self.numtickers)
+        tensor_to_add_repeated = tensor_to_add.repeat(self.validation_norm.shape[0], 1)
+        validation_data=torch.cat((tensor_to_add_repeated,self.validation_norm),dim=1)
+        
+        reward_rec=[]
+        action_rec=[]
+        total_port=[]
+        holding=[]
         current_features = validation_data[0, :]
         current_holding = self.validation_holding[0, :]
-        reward_rec=[]
-
-        
+        #holding.append(current_holding)
         for index_val in range(len(self.validation_holding)-1):               
                         
             next_state_features = validation_data[index_val+1, :]
@@ -358,17 +388,80 @@ class TD3Agent:
             #done = is_end_of_episode(next_index)
 
             # Update state and calculate reward based on your function
-            normalized_action=self.actor(current_features).tolist()
-            print(normalized_action)
-            action=agent.select_action(normalized_action,current_holding)
-            next_state_features,next_state_holding,reward = agent.update_state_and_calculate_reward(action, current_features,next_state_features,current_holding, next_state_holding)
-            reward_rec.append(reward)
+            if actionstrategy=='model':
+                current_features=current_features.to(torch.float32)
+                normalized_action=self.actor(current_features)
+            elif actionstrategy=='random':
+                normalized_action = torch.rand(self.numtickers) * 2 - 1
+            elif actionstrategy=='hold':
+                normalized_action = torch.zeros(self.numtickers)
+            #print(normalized_action)
+            action=agent.select_action(normalized_action.tolist(),current_holding)
+            next_state_features,next_state_holding,reward,new_total_port = self.update_state_and_calculate_reward(action, current_features,next_state_features,current_holding, next_state_holding)
+            #print(f'action:{action}',f'reward:{reward}')
+            reward_rec.append(reward.item())
+            total_port.append(new_total_port.item())
             current_features=next_state_features
-            current_holding=next_state_holding            
+            current_holding=next_state_holding  
+            action_rec.append(action.tolist())
+            holding.append(next_state_holding.tolist())          
             #next_state_holding,reward 
-        return reward
-            
-def datapre(ticker,capital):
+        return action_rec,reward_rec ,total_port,holding
+    
+    def validate_all_models(self,path,actionstrategy='model'):
+        #ensemble_rewards = []
+        reward_ensemble=[]
+        action_ensemble=[]
+        total_port_ensemble=[]
+        holding_ensemble=[]
+        model_files = glob.glob(os.path.join(path, '*_actor.pth'))
+        for model_file in model_files:
+            print(f"Validating model: {model_file}")
+            self.actor.load_state_dict(torch.load(model_file, map_location=device))
+            self.actor.eval()
+            action_rec,reward_rec,total_port_rec,holding_rec = self.validate_single_mdoel(actionstrategy)
+            action_ensemble.append(action_rec)
+            reward_ensemble.append(reward_rec)
+            total_port_ensemble.append(total_port_rec)
+            holding_ensemble.append(holding_rec)
+            print(f'model:{model_file} reward:{sum(reward_rec)}')
+            break
+        #ensemble_rewards = [sum(x)/len(x) for x in zip(*reward_ensemble)] 
+        holding_rec=[self.validation_holding[0, :].tolist()]+holding_rec
+        action_rec=action_rec+np.zeros(self.numtickers)
+        total_port_rec=total_port_rec+[0]
+        reward_rec=[0]+reward_rec
+        x=np.append(action_rec, [np.zeros(self.numtickers)], axis=0)
+        final=pd.DataFrame({'holding':holding_rec,'action':x.tolist(),'total_port':total_port_rec,'reward_ensemble':reward_rec})
+        tickholding=[f'{i}_holding' for i in self.tickers]
+        tickprice=[f'{i}_closeprice' for i in self.tickers]
+        list_df=pd.DataFrame(final['holding'].tolist(), index=final.index)
+        list_df.columns=['date','cashbalance']+tickholding+tickprice
+        final = final.join(list_df)
+        final.drop('holding', axis=1, inplace=True)
+        #final[['date','cashbalance']+tickholding+tickprice] = final['holding'].str.split(',', expand=True)
+        return final[0:-2]
+    
+    def get_ensemble_action(self, state, model_paths):
+        actions_from_all_models = []
+
+        for model_path in model_paths:
+            model = self.load_model(model_path)
+            model.eval()
+            with torch.no_grad():
+                action = model(state).numpy()  # Assuming the model returns a tensor
+            actions_from_all_models.append(action)
+
+        # Average the actions from all models
+        average_action = np.mean(actions_from_all_models, axis=0)
+        return average_action
+
+    def load_model(self, model_path):
+        model = Actor(...)  # Initialize your model (ensure it's the same architecture)
+        model.load_state_dict(torch.load(model_path))
+        model.to(device)
+        return model
+def datapre(ticker,tradeticker,capital=0,inital_holding=0):
     # Loop through each ticker to calculate indicators
     data = yf.download(tickers)
     data = data.dropna()
@@ -379,7 +472,6 @@ def datapre(ticker,capital):
         high = data['High', ticker].astype('double').values
         low = data['Low', ticker].astype('double').values
         volume = data['Volume', ticker].astype('double').values
-        captial = 100000*np.ones(len(close))
         # Calculate each indicator for the ticker        
         indicators[ticker] = {#'close':close,
             'logreturn':np.insert(np.log(close[1:] / close[:-1]), 0, np.nan),
@@ -399,7 +491,7 @@ def datapre(ticker,capital):
     close=data['Close'].astype('double').values
     ticker_matrices = [np.column_stack([v for k, v in ticker_data.items()]) for ticker_data in indicators.values()]
     data_matrix_3d = np.stack(ticker_matrices, axis=1)
-
+    data_matrix_3d = data_matrix_3d.astype(np.float32)
     # Convert your existing 3D NumPy array to a tensor
     data_tensor_3d = torch.from_numpy(data_matrix_3d)  # Shape: (5356, 4, 11)
     dates=np.array(data.index).astype(str)
@@ -407,10 +499,10 @@ def datapre(ticker,capital):
     timestamps_tensor = torch.tensor(dates_only).unsqueeze(1)#.unsqueeze(1)
     #capital = 1e6
     num_days = timestamps_tensor.shape[0]
-    num_tickers=len(tickers)
+    num_tickers=tradeticker
     capital_column = np.full((num_days, 1), capital)
-    holdings_columns = np.zeros((num_days, num_tickers))
-    combined_array = torch.tensor(np.hstack([capital_column,holdings_columns,close]))
+    holdings_columns = np.ones((num_days, num_tickers))* inital_holding
+    combined_array = torch.tensor(np.hstack([capital_column,holdings_columns,close[:,0:num_tickers]]))
     capital_holdings_with_time_tensor = torch.cat([timestamps_tensor, combined_array], dim=1)  # Shape: [days, 1, features + 1]
     capital_holdings_with_time_tensor
     def preprocess_state(portfolio, features):
@@ -421,24 +513,52 @@ def datapre(ticker,capital):
         #features_flat = torch.nan_to_num(features_flat, nan=0.0)
         # Concatenate the portfolio and features along the second dimension
         state = torch.cat([portfolio_flat, features_flat], dim=1)
-        state = state.to(torch.float32)
+        #state = state.to(torch.float32)
         return state
 
     # Sample usage:
     #state_dict = {'portfolio': tensor(...), 'features': tensor(...)}
-    return preprocess_state(capital_holdings_with_time_tensor, data_tensor_3d)[33:]
+    result=preprocess_state(capital_holdings_with_time_tensor, data_tensor_3d)
+    return result[33:]
 # Experience Replay Memory
 
 
 if __name__=="__main__":
-    tickers = ['QQQ', 'SPY', 'IWM', 'TLT']
-
-    data=datapre(tickers,1000000)
+    tickers = ['IWM','SPY','QQQ','TLT','AAPL','META','GOOG','TSLA','MSFT','BAC','JPM','NVDA']
+    num_tickers = len(tickers)
+    inital_holding=np.random.randint(500, 1000, size=num_tickers)
+    
+    
+    data=datapre(tickers,num_tickers,0,inital_holding)
     #state=data[:,1:]
     # Initialize the DRL agent
-    num_tickers = len(tickers)
-    agent = TD3Agent(len(tickers),data)
-    agent.generate_experience();
-    #agent.validation('model1')
+    
+    agent = TD3Agent(num_tickers,tickers[0:num_tickers],data)
+    
+    #agent.generate_experience(label='multiple') #this is training step
+    
+    file='validation_zerocash_v2'
+    
+    #/mnt/c/Users/wanghu01/SCPD/CS221/2023-2024/project/cs221/2023-11-26_20-29-22_model_chekpoint
+    #folder='2023-11-28_08-45-27_model_chekpoint_date_fixd'
+    folder='2023-11-28_13-31-16_model_chekpoint_multiple'
+    #/mnt/c/Users/wanghu01/SCPD/CS221/2023-2024/project/cs221/
+    #2023-11-28_13-31-16_model_chekpoint_multiple
+    print(f'inital_holding:{inital_holding}')
+    
+    file_name = f'{file}.xlsx'
+    
+    with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
+        result=agent.validate_all_models(f'./{folder}')
+        result.to_excel(writer,sheet_name='model_performance',index=False)   
+        result=agent.validate_all_models(f'./{folder}',actionstrategy='random')
+        result.to_excel(writer,sheet_name='random_performance',index=False)  
+        result=agent.validate_all_models(f'./{folder}',actionstrategy='hold')
+        result.to_excel(writer,sheet_name='hold_performance',index=False)  
+    #result.to_csv(f'./{file}.csv',index=False,header=True)
+    
+    #result.to_csv(f'./{file}_rand.csv',index=False,header=True)
+    
+    
     
         
